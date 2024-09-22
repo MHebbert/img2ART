@@ -1,0 +1,329 @@
+import cv2
+import numpy as np
+import json
+
+#Global variable for  determining what level no lines will be applied on final drawing
+global no_line_threshold_index
+no_line_threshold_index = 0  # Default value
+
+#Global variable to store rectangular region on the image
+global mask_rect
+
+#Boolean flagfor to indicate whether the user is drawing the rectangle
+drawing = False
+
+'''
+Rectangle selected by user for use in edited image
+
+:param Image_path: file path for desired image
+
+:return rect(tuple): The top left corner, and height and width of the drawn rectangle
+'''
+def select_rectangle(image_path):
+    global mask_rect, drawing, img
+
+    #NEsted function to handle mouse events on the image window while the user draws a rectangle
+    def on_mouse(event, x, y, flags, param):
+        global rect, drawing, img
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            rect = (x, y, x, y)  # Update rect starting point
+            drawing = True
+        elif event == cv2.EVENT_MOUSEMOVE and drawing:
+            img_temp = img.copy()  # Create a copy of the image for drawing the rectangle
+            cv2.rectangle(img_temp, (rect[0], rect[1]), (x, y), (0, 255, 0), 2)
+            cv2.imshow('Image', img_temp)
+        elif event == cv2.EVENT_LBUTTONUP:
+            rect = (rect[0], rect[1], x - rect[0], y - rect[1])  # Finalize rect coordinates
+            drawing = False
+            cv2.rectangle(img, (rect[0], rect[1]), (x, y), (0, 255, 0), 2)
+            cv2.imshow('Image', img)
+    #Load iamge
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    #Checks if image loaded correctly
+    if img is None:
+        print("Image not found or unable to open.")
+        return
+
+    #shows image and calls on_mouse to determine rectangle location
+    cv2.namedWindow('Image')
+    cv2.setMouseCallback('Image', on_mouse)
+    cv2.imshow('Image', img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+    return rect  # Return the selected rectangle coordinates
+
+#Function to update threshold values and updates image for user to change settings
+def update_thresholds(val=0):
+    global selectively_blurred, shaded, thresholds, no_line_threshold_index
+
+    #gets trackbar positions
+    low_threshold = cv2.getTrackbarPos('Low Threshold', 'Controls')
+    high_threshold = cv2.getTrackbarPos('High Threshold', 'Controls')
+    min_line_size = cv2.getTrackbarPos('Min Line Size', 'Controls')
+    no_line_threshold_index = cv2.getTrackbarPos('No Line Index', 'Controls')
+
+    #updates thresholds based on trackbar locations
+    if len(thresholds) > 0:
+        for i in range(len(thresholds)):
+            thresholds[i] = cv2.getTrackbarPos(f'Threshold {i}', 'Controls')
+
+    # digitizes images to create shaded regions based on thresholds
+    shaded = np.digitize(selectively_blurred, bins=thresholds, right=True) * (255 // (len(thresholds) + 1))
+    shaded = shaded.astype(np.uint8)
+
+    #Generates a cross-hatched image based on shaded regions
+    directions = ['horizontal', 'vertical', 'diagonal1', 'diagonal2', 'diagonal3', 'diagonal4', 'diagonal5'] #directions for lines to be drawn
+    spacing = 20 # pixels between hatching lines
+    hatching_image = create_cross_hatching(shaded, thresholds, directions, spacing, no_line_threshold_index)
+
+    # Combine hatched image with edge detection for better detail capturing
+    # Displays results
+    combined_image = cv2.cvtColor(hatching_image, cv2.COLOR_GRAY2BGR)
+    edges = cv2.Canny(selectively_blurred, low_threshold, high_threshold)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (min_line_size, min_line_size)))
+    combined_image[edges == 255] = [0, 0, 0]  # Color edges black for visibility
+    cv2.imshow('Result', combined_image)
+
+#Function to save current settings to JSON file and close all OpenCV windows.
+def save_and_close():
+    #Stores the current trackbar settings into a dictionary
+    current_settings = {
+        'low_threshold': cv2.getTrackbarPos('Low Threshold', 'Controls'),
+        'high_threshold': cv2.getTrackbarPos('High Threshold', 'Controls'),
+        'min_line_size': cv2.getTrackbarPos('Min Line Size', 'Controls'),
+        'thresholds': [cv2.getTrackbarPos(f'Threshold {i}', 'Controls') for i in range(len(thresholds))],
+        'no_line_threshold_index': cv2.getTrackbarPos('No Line Index', 'Controls')  # Ensure key name consistency
+    }
+    #Saves settings into a dictionary as a JSON file
+    with open('settings.json', 'w') as f:
+        json.dump(current_settings, f)
+    print("Current Settings:", current_settings)#prints settings for varification
+    cv2.destroyAllWindows()
+
+
+'''
+Applies grayscale conversion, gamma correction, Gaussian blur, and selective blur based on a mask.
+
+:param img: Input image in color.
+:param blur_kernel_size: Size of the kernel for Gaussian blur.
+:param gamma_correction: Gamma value for correction.
+:param mask_rect: Tuple of (x, y, width, height) for selective blurring area.
+
+:return: Selectively blurred image.
+'''
+def process_image(img, blur_kernel_size=(9, 9), gamma_correction=0.5, mask_rect=None):
+    
+    # Convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Apply gamma correction
+    gray_corrected = np.array(255 * (gray / 255) ** gamma_correction, dtype='uint8')
+    # Apply Gaussian blur
+    blurred = cv2.GaussianBlur(gray_corrected, blur_kernel_size, 0)
+    
+    # Apply selective blur based on mask
+    if mask_rect:
+        mask = np.zeros_like(gray, dtype='uint8')
+        x, y, w, h = mask_rect
+        cv2.rectangle(mask, (x, y), (x+w, y+h), (255), thickness=-1)
+        selectively_blurred = np.where(mask == 255, gray_corrected, blurred)
+    else:
+        selectively_blurred = blurred
+    
+    return selectively_blurred
+
+'''
+Applies selective blur and shading withe interactive trackbar
+:Param image_path(str): Path to input image
+'''
+def selective_blur_and_shade_with_trackbars(image_path):
+    global selectively_blurred, shaded, thresholds, no_line_threshold_index, mask_rect
+
+    #Loads image
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        print("Image not found or unable to open.")
+        return
+
+    # checks if mask-rect is saved, if not, sets default rectangle
+    if 'mask_rect' not in globals():
+        mask_rect = (100, 15, 200, 170)  # Example default rectangle
+
+    # Process the image using process image, passing settings to function
+    selectively_blurred = process_image(img, blur_kernel_size=(9, 9), gamma_correction=0.5, mask_rect=mask_rect)
+
+    #Initiates threshold values
+    thresholds = [20, 40, 60, 80, 100, 120, 140, 160]  # Initial thresholds
+    shaded = np.digitize(selectively_blurred, bins=thresholds, right=True) * (255 // (len(thresholds) + 1))
+    shaded = shaded.astype(np.uint8)
+
+    # Setup trackbars and window
+    cv2.namedWindow('Controls')
+    cv2.createTrackbar('Low Threshold', 'Controls', 20, 100, update_thresholds)
+    cv2.createTrackbar('High Threshold', 'Controls', 70, 200, update_thresholds)
+    cv2.createTrackbar('Min Line Size', 'Controls', 1, 10, update_thresholds)
+    for i, threshold in enumerate(thresholds):
+        cv2.createTrackbar(f'Threshold {i}', 'Controls', threshold, 255, update_thresholds)
+    cv2.createTrackbar('No Line Index', 'Controls', 0, len(thresholds)-1, update_thresholds)
+
+    cv2.namedWindow('Result')
+    update_thresholds()
+
+    while True:
+        if cv2.waitKey(1) & 0xFF == ord('h'):
+            save_and_close()
+            break
+    cv2.destroyAllWindows()
+
+'''
+Creates cross-hatched image based on shaded regions
+
+:param image (array): Grayscale image to be cross-hatched.
+:param thresholds (list): List of threshold values for different shading levels.
+:param directions (list): List of directions for the cross-hatching lines.
+:param spacing (int): Spacing between lines.
+:param no_line_threshold_index (int): Threshold index below which no lines are drawn.
+
+:return hatching_image (array): Image with cross-hatching patterns applied.
+'''
+def create_cross_hatching(image, thresholds, directions, spacing, no_line_threshold_index=0):
+    height, width = image.shape
+    hatching_image = 255 * np.ones((height, width), dtype=np.uint8)  # Create a white background
+
+    # Adjust direction application based on a designated 'no line' threshold index
+    for level, threshold in enumerate(reversed(thresholds)):
+        mask = image <= threshold  # Apply threshold to create mask
+        if level < no_line_threshold_index:
+            continue  # Skip line drawing for levels below the no line threshold index
+        applicable_directions = directions[:level - no_line_threshold_index + 1]
+        
+        for direction in applicable_directions:
+            if direction == 'vertical':
+                for i in range(0, width, spacing + 4):
+                    hatching_image[:, i][mask[:, i]] = 0
+            elif direction == 'horizontal':
+                for i in range(0, height, spacing + 2):
+                    hatching_image[i, :][mask[i, :]] = 0
+
+            elif direction == 'diagonal1':
+                for offset in range(-height + 1, width, spacing):
+                    start_row = max(-offset, 0)
+                    end_row = min(height, width - offset)
+                    for row in range(start_row, end_row):
+                        col = row + offset
+                        if mask[row, col]:
+                            hatching_image[row, col] = 0
+            
+            elif direction == 'diagonal2':
+                for offset in range(-height + 1, width, spacing-2):
+                    start_row = max(-offset, 0)
+                    end_row = min(height, width - offset)
+                    for row in range(start_row, end_row):
+                        col = width - 1 - (row + offset)
+                        if mask[row, col]:
+                            hatching_image[row, col] = 0
+            
+            elif direction == 'diagonal3':
+                for offset in range(-height + 3, width, spacing-2):
+                    for row in range(height):
+                        col = row + offset
+                        if 0 <= col < width and mask[row, col]:
+                            hatching_image[row, col] = 0
+
+       
+
+    return hatching_image
+
+'''
+Recreates image based on saved thresholds
+
+:param image_path (str): Path to the input image.
+:param settings_path (str): Path to the JSON file containing saved settings.
+
+:return combined_image (array): Processed image with cross-hatching and edge detection applied.
+'''
+def recreate_image_with_saved_thresholds(image_path, settings_path='settings.json'):
+    global selectively_blurred, shaded, thresholds, no_line_threshold_index, mask_rect
+
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        print("Image not found or unable to open.")
+        return
+
+    # Ensure mask_rect is defined before using it; you might need logic here to set it if not already set
+    if 'mask_rect' not in globals():
+        mask_rect = (100, 15, 200, 170)  # Example default rectangle
+
+    # Process the image with correct parameter passing
+    selectively_blurred = process_image(img, blur_kernel_size=(9, 9), gamma_correction=0.5, mask_rect=mask_rect)
+
+    with open(settings_path, 'r') as f:
+        settings = json.load(f)
+
+    thresholds = settings.get('thresholds', [])
+    low_threshold = settings.get('low_threshold', 50)
+    high_threshold = settings.get('high_threshold', 150)
+    min_line_size = settings.get('min_line_size', 5)
+    no_line_threshold_index = settings.get('no_line_threshold_index', 0)  # Safely load with default
+
+    shaded = np.digitize(selectively_blurred, bins=thresholds, right=True) * (255 // (len(thresholds) + 1))
+    shaded = shaded.astype(np.uint8)
+
+    directions = ['horizontal', 'vertical', 'diagonal1', 'diagonal2', 'diagonal3', 'diagonal4', 'diagonal5']
+    spacing = 20
+
+    hatching_image = create_cross_hatching(shaded, thresholds, directions, spacing, no_line_threshold_index)
+
+    edges = cv2.Canny(selectively_blurred, low_threshold, high_threshold)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (min_line_size, min_line_size)))
+
+    combined_image = cv2.cvtColor(hatching_image, cv2.COLOR_GRAY2BGR)
+    combined_image[edges == 255] = [0, 0, 0]  # Color edges black for visibility
+
+    cv2.imshow('Recreated Result with Cross Hatching', combined_image)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    return combined_image
+
+'''
+Saves image to desired file path
+:param image (array): OpenCV image array.
+:param file_path (str): Path where the image will be saved, including the file name and extension.
+'''
+def save_image(image, file_path):
+    """
+    Saves an OpenCV image to a specified file path.
+    :param image: OpenCV image array.
+    :param file_path: Path where the image will be saved, including the file name and extension.
+    """
+    # Convert image from BGR to RGB (Inkscape uses RGB, OpenCV uses BGR by default)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    # Write the image to file
+    cv2.imwrite(file_path, image_rgb)
+    print(f"Image saved to {file_path}")
+
+'''
+Main function to execute the entire image processing workflow.
+
+:param image_path (str): Path to the input image.
+'''
+def main(image_path):
+
+    # Select the region of the image to focus on
+    mask_rect = select_rectangle(image_path)
+
+    # Apply selective blur and shading with interactive trackbars
+    selective_blur_and_shade_with_trackbars(image_path)
+
+    # Recreate the image with saved thresholds and get the processed image
+    processed_image = recreate_image_with_saved_thresholds(image_path)
+    if processed_image is None:
+        print("Error processing the image.")
+        return
+    save_image(processed_image,r"C:\Users\Matthew\Pictures\Opensauce\testpath.png")
+   
+# Path to your image
+image_path = r'D:\Matthew\Music\Screenshot 2024-05-30 125442.png'
+main(image_path)
